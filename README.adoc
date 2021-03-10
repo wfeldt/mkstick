@@ -1,0 +1,5 @@
+== mkstick
+
+A script to create a template image for putting several SUSE installation media on a USB stick.
+
+Or something like that...
