@@ -1,0 +1,123 @@
+#! /bin/bash
+
+file=$1
+
+image_GiB=1
+grub_MiB=8
+esp_MiB=32
+
+iso=/data/iso/openSUSE-Leap-15.0-NET-x86_64-Build267.2-Media.iso
+
+mods="
+  gfxmenu gfxterm
+  video videoinfo vga vbe
+  biosdisk linux
+  ext2 btrfs xfs jfs reiserfs iso9660 tar memdisk
+  cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256
+  all_video boot cat chain configfile echo
+  font gzio halt
+  jpeg minicmd normal part_apple part_msdos part_gpt
+  password_pbkdf2 png reboot search search_fs_uuid
+  search_fs_file search_label sleep test video fat loadenv
+  loopback
+"
+
+if [ -z "$file" ] ; then
+  echo "usage: mkstick FILE"
+  exit 1
+fi
+
+rm -f "$file"
+dd if=/dev/zero of="$file" bs=1G count=0 seek=$image_GiB status=none
+
+parted -s "$file" mklabel gpt
+parted -s "$file" mkpart "GRUB" 1MiB $((grub_MiB+1))MiB
+parted -s "$file" mkpart "ESP" $((grub_MiB+1))MiB $((grub_MiB+esp_MiB+1))MiB
+parted -s "$file" mkpart "IMAGES" $((grub_MiB+esp_MiB+1))MiB 100%
+parted -s "$file" set 1 bios_grub on
+parted -s "$file" set 2 esp on
+# parted -s "$file" disk_set pmbr_boot on
+
+efi_ofs=$(((grub_MiB+1)*2048*512))
+part_ofs=$(((grub_MiB+esp_MiB+1)*2048*512))
+part_end=$(((image_GiB*1024-1)*2048*512))
+
+dd if=/dev/zero of=esp bs=1b count=0 seek=1 status=none
+mformat -i esp -T $((esp_MiB*2048)) -H $(((grub_MiB+1)*2048)) -s 32 -h 64 -c 1 -d 1 -v 'EFI_PART' ::
+dd if=esp of="$file" bs=1b seek=$(((grub_MiB+1)*2048)) conv=notrunc status=none
+rm esp
+sync
+
+loop=$(losetup -f)
+sw 0 losetup -o $part_ofs --sizelimit $((part_end-part_ofs)) $loop "$file"
+sw 0 mkfs.ext4 -q $loop
+sync
+
+sw 0 mount $loop mnt2
+[ -d mnt2/lost+found ] && sw 0 rmdir mnt2/lost+found
+sw 0 chmod 777 mnt2
+
+loop1=$(losetup -f)
+sw 0 losetup -o $efi_ofs --sizelimit $((part_ofs-efi_ofs)) $loop1 "$file"
+sw 0 mount -oumask=0 $loop1 mnt1
+
+mkdir -p mnt1/boot/grub2/i386-pc
+cp /usr/share/grub2/i386-pc/boot.img mnt1/boot/grub2/i386-pc
+
+cat > load.cfg <<XXX
+search --no-floppy --file --set=root /bootiso/grub2/grub.cfg
+set prefix=(\$root)/bootiso/grub2
+XXX
+
+cat > efi.cfg <<XXX
+insmod /EFI/BOOT/loopback.mod
+insmod efi_gop
+insmod efi_uga
+function linux {
+  linuxefi \$*
+}
+function initrd {
+  initrdefi \$*
+}
+XXX
+
+cat load.cfg >> efi.cfg
+
+(cd memdisk ; tar -cf ../memdisk.tar * )
+
+grub2-mkimage -O i386-pc -m memdisk.tar -p "(memdisk)" \
+  -c load.cfg -o mnt1/boot/grub2/i386-pc/core.img $mods
+# ???
+sw 0 grub2-bios-setup -s -d mnt1/boot/grub2/i386-pc "$file"
+
+rm memdisk.tar
+
+mkdir -p mnt2/bootiso/grub2/themes
+for i in /boot/grub2/themes/* ; do
+  cp -a $i mnt2/bootiso/grub2/themes/openSUSE
+  cp /usr/share/grub2/unicode.pf2 mnt2/bootiso/grub2/themes/openSUSE
+  perl -pi -e 's/(E: Edit Entry)/$1     T: Text Mode/' mnt2/bootiso/grub2/themes/openSUSE/theme.txt
+  break
+done
+
+cp $iso mnt2/bootiso/
+
+rm -r mnt1/boot
+
+sw 0 mkdir -p mnt1/EFI/BOOT
+sw 0 cp /usr/share/grub2/x86_64-efi/grub.efi mnt1/EFI/BOOT/
+sw 0 cp  /usr/share/grub2/x86_64-efi/loopback.mod  mnt1/EFI/BOOT/
+sw 0 cp /usr/lib64/efi/MokManager.efi mnt1/EFI/BOOT/
+sw 0 cp /usr/lib64/efi/shim.efi mnt1/EFI/BOOT/bootx64.efi
+echo configfile \$prefix/grub.cfg >> efi.cfg
+sw 0 cp efi.cfg mnt1/EFI/BOOT/grub.cfg
+cp cfg/grub.cfg mnt2/bootiso/grub2
+rm -f load.cfg efi.cfg
+
+echo 'item openSUSE-Leap-15.0-NET-x86_64-Build267.2-Media.iso "openSUSE Leap 15.0"' >> mnt2/bootiso/grub2/grub.cfg
+
+umnt mnt2
+umnt mnt1
+
+sw 0 losetup -d $loop
+sw 0 losetup -d $loop1
